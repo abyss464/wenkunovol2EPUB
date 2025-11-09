@@ -1,0 +1,7 @@
+# -- Wenku8.net 登录凭据 --
+
+USERNAME = "name"
+PASSWORD = "password"
+NOVEL_LIST = [
+    "安达与岛村",
+]
