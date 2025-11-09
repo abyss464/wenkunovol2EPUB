@@ -9,6 +9,7 @@
 ```bash
 pip install -r requirements.txt
 ```
+安装Chrome浏览器
 
 ## 2. 配置 `config.py`
 
