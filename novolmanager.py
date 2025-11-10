@@ -27,11 +27,6 @@ except ImportError:
     print("错误：无法找到 config.py 文件。")
     exit()
 
-
-# ===============================================================
-# 哈希校验与增量更新函数 (新增)
-# ===============================================================
-
 def get_file_sha256(filepath):
     """计算文件的SHA256哈希值"""
     sha256_hash = hashlib.sha256()
@@ -82,14 +77,7 @@ def check_hashes(hash_file_path, download_dir):
         print("哈希校验失败或文件不完整，需要重新下载插图。")
         return False, None
 
-
 def create_epub(book_title, metadata, txt_file_path, illustration_data, output_dir, cover_path=None):
-    """
-    1.  修复了因正则表达式嵌套捕获组导致 re.split 结果错位，将正文识别为标题的严重错误。
-    2.  保留了v4版本的所有优点（健壮循环、精准章节、清爽目录等）。
-    3.  彻底解决了 EpubLib 封面、NCX、Nav 重复添加的问题。
-    4.  修复了 'EpubImage' object has no attribute 'uid' 错误，通过更健壮的封面处理逻辑。
-    """
     print("\n" + "=" * 15 + " 开始创建EPUB文件" + "=" * 15)
     safe_book_title = re.sub(r'[\\/*?:"<>|]', '', book_title)
     epub_file_path = os.path.join(output_dir, f"{safe_book_title}.epub")
@@ -308,7 +296,6 @@ def create_epub(book_title, metadata, txt_file_path, illustration_data, output_d
     epub.write_epub(epub_file_path, book, {})
     print(f"EPUB文件已成功创建: {epub_file_path}")
 
-
 def scrape_metadata(driver):
     """在小说详情页抓取作者、简介和封面URL"""
     metadata = {'author': '未知', 'synopsis': '无', 'cover_url': None}
@@ -364,9 +351,6 @@ def scrape_metadata(driver):
 
     return metadata
 
-# ===============================================================
-# 总指挥与下载函数 (集成哈希校验逻辑)
-# ===============================================================
 def find_and_download_novel(driver, book_title):
     print("\n" + "=" * 20 + f" 开始处理书籍: {book_title} " + "=" * 20)
 
@@ -468,6 +452,158 @@ def find_and_download_novel(driver, book_title):
     # 将封面路径传递给 create_epub
     create_epub(book_title, metadata, txt_save_path, illustration_data, download_dir, cover_path=cover_image_path)
 
+def download_illustrations(driver, book_title):
+    print("\n" + "-" * 15 + " 开始处理插图（精确模式）" + "-" * 15)
+    volume_images_map = {}
+    try:
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, "小说目录"))).click()
+        novel_index_window = driver.current_window_handle
+        table_body = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "tbody")))
+        rows = table_body.find_elements(By.TAG_NAME, "tr")
+        volume_to_illustration_map = {}
+        current_volume_name = ""
+        for row in rows:
+            try:
+                volume_header = row.find_element(By.CLASS_NAME, "vcss")
+                current_volume_name = re.sub(r'[\\/*?:"<>|]', '', volume_header.text.strip())
+            except NoSuchElementException:
+                if current_volume_name:
+                    for link in row.find_elements(By.TAG_NAME, "a"):
+                        if "插图" in link.text:
+                            volume_to_illustration_map[current_volume_name] = link.get_attribute('href')
+                            break
+
+        if not volume_to_illustration_map:
+            print("未发现插图链接。")
+            return {}
+        download_tasks = []
+        for volume_name, url in volume_to_illustration_map.items():
+            delay = random.uniform(1.5, 3.5)
+            print(f"正在分析《{volume_name}》的插图页面...")
+            time.sleep(delay)
+            driver.execute_script(f"window.open('{url}');")
+            driver.switch_to.window(driver.window_handles[-1])
+            try:
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, "imagecontent")))
+                image_elements = driver.find_elements(By.CLASS_NAME, "imagecontent")
+                image_srcs = [img.get_attribute('src') for img in image_elements if img.get_attribute('src')]
+                if image_srcs:
+                    safe_book_title = re.sub(r'[\\/*?:"<>|]', '', book_title)
+                    illust_dir = os.path.join("download", safe_book_title, volume_name)
+                    os.makedirs(illust_dir, exist_ok=True)
+                    volume_images_map[volume_name] = []
+                    current_page_url = driver.current_url
+                    for j, img_src in enumerate(image_srcs):
+                        file_name = os.path.basename(urlparse(img_src).path) or f"{j + 1:02d}.jpg"
+                        save_path = os.path.join(illust_dir, file_name)
+                        # 添加任务，稍后统一处理
+                        download_tasks.append((img_src, save_path, current_page_url))
+                        volume_images_map[volume_name].append(save_path)
+            finally:
+                driver.close()
+                driver.switch_to.window(novel_index_window)
+        if not download_tasks:
+            return {}
+        # --- [核心修改] ---
+        # 统一执行下载任务，并显示进度
+        total_tasks = len(download_tasks)
+        print(f"\n准备下载 {total_tasks} 张插图...")
+
+        # 使用 enumerate 来获取任务索引，用于显示进度
+        tasks_with_progress = [
+            (task[0], task[1], task[2], f"{i + 1}/{total_tasks}")
+            for i, task in enumerate(download_tasks)
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # 使用 lambda 将包含进度信息的元组解包后传递给 download_image
+            futures = [executor.submit(download_image, *task) for task in tasks_with_progress]
+            # 等待所有任务完成
+            concurrent.futures.wait(futures)
+
+        print(f"插图下载处理完成。")
+        # --- [修改结束] ---
+    except Exception as e:
+        print(f"插图处理出错: {e}")
+        return {}
+    return volume_images_map
+
+def download_image(url, save_path, referer_url, progress_info):
+    """
+    下载单张图片，增加了进度提示、重试机制和延时。
+    """
+    MAX_RETRIES = 3  # 最大重试次数
+    RETRY_DELAY = 1  # 重试前等待秒数
+    for attempt in range(MAX_RETRIES):
+        try:
+            proxies = {"http": None, "https": None}
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Referer': referer_url}
+
+            response = requests.get(url, headers=headers, proxies=proxies, timeout=30)
+
+            if response.status_code == 200:
+                with open(save_path, 'wb') as f:
+                    f.write(response.content)
+                print(f"  [ {progress_info} ] 下载成功: {os.path.basename(save_path)}")
+                return True  # 成功后直接返回
+            else:
+                # 处理 HTTP 错误，如 404 Not Found
+                print(
+                    f"  [ {progress_info} ] 下载失败 (HTTP {response.status_code})，文件名: {os.path.basename(save_path)}")
+        except requests.exceptions.RequestException as e:
+            # 处理网络层面的错误，如超时、连接失败
+            # 为了简洁，只打印一个通用的网络错误信息
+            print(f"  [ {progress_info} ] 下载失败 (网络错误)，文件名: {os.path.basename(save_path)}")
+        # 如果代码执行到这里，说明本次尝试失败
+        if attempt < MAX_RETRIES - 1:
+            print(f"    -> 准备重试 ({attempt + 1}/{MAX_RETRIES - 1})... 等待 {RETRY_DELAY} 秒")
+            time.sleep(RETRY_DELAY)
+        else:
+            print(f"  [ {progress_info} ] 最终下载失败: {os.path.basename(save_path)}")
+
+    return False  # 所有重试都失败后返回
+
+def login_wenku8(driver, username, password):
+    print("正在尝试登录...");
+    try:
+        u, p, b = driver.find_element(By.NAME, "username"), driver.find_element(By.NAME,
+                                                                                "password"), driver.find_element(
+            By.NAME, "submit")
+        u.send_keys(username);
+        p.send_keys(password);
+        b.click();
+        time.sleep(10)
+        if "欢迎您" in driver.page_source:
+            print("登录成功！"); return True
+        else:
+            print("登录失败"); return False
+    except Exception as e:
+        print(f"登录时出错: {e}"); return False
+
+def search_for_novel(driver, book_title):
+    try:
+        s, b = driver.find_element(By.ID, "searchkey"), driver.find_element(By.NAME, "Submit")
+        s.clear();
+        s.send_keys(book_title);
+        b.click();
+        return True
+    except Exception as e:
+        print(f"搜索时出错: {e}"); return False
+
+def download_txt(novel_id, node, save_path, cookies, referer_url):
+    url = f"https://dl.wenku8.com/down.php?type=txt&node={node}&id={novel_id}"
+    print(f"正在从 Node={node} 下载TXT...")
+    try:
+        proxies = {"http": None, "https": None}
+        headers = {'User-Agent': 'Mozilla/5.0 ...', 'Referer': referer_url}
+        response = requests.get(url, cookies=cookies, timeout=60, proxies=proxies, headers=headers)
+        if response.ok and len(response.content) > 100:
+            with open(save_path, 'wb') as f: f.write(response.content)
+            return True
+    except Exception:
+        pass
+    return False
 
 # ===============================================================
 # 主程序入口 (修改为自动化列表处理)
@@ -501,115 +637,6 @@ def main():
     finally:
         print("\n正在关闭浏览器...");
         driver.quit()
-
-
-# 其它函数定义（为保证可运行性，复制过来）
-def download_illustrations(driver, book_title):
-    print("\n" + "-" * 15 + " 开始处理插图（精确模式）" + "-" * 15)
-    volume_images_map = {}
-    try:
-        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, "小说目录"))).click()
-        novel_index_window = driver.current_window_handle
-        table_body = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "tbody")))
-        rows = table_body.find_elements(By.TAG_NAME, "tr")
-        volume_to_illustration_map = {}
-        current_volume_name = ""
-        for row in rows:
-            try:
-                volume_header = row.find_element(By.CLASS_NAME, "vcss")
-                current_volume_name = re.sub(r'[\\/*?:"<>|]', '', volume_header.text.strip())
-            except NoSuchElementException:
-                if current_volume_name:
-                    for link in row.find_elements(By.TAG_NAME, "a"):
-                        if "插图" in link.text: volume_to_illustration_map[current_volume_name] = link.get_attribute(
-                            'href'); break
-        if not volume_to_illustration_map: print("未发现插图链接。"); return {}
-        download_tasks = []
-        for volume_name, url in volume_to_illustration_map.items():
-            delay = random.uniform(1.5, 3.5);
-            time.sleep(delay)
-            driver.execute_script(f"window.open('{url}');");
-            driver.switch_to.window(driver.window_handles[-1])
-            try:
-                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, "imagecontent")))
-                image_elements = driver.find_elements(By.CLASS_NAME, "imagecontent")
-                image_srcs = [img.get_attribute('src') for img in image_elements if img.get_attribute('src')]
-                if image_srcs:
-                    safe_book_title = re.sub(r'[\\/*?:"<>|]', '', book_title)
-                    illust_dir = os.path.join("download", safe_book_title, volume_name);
-                    os.makedirs(illust_dir, exist_ok=True)
-                    volume_images_map[volume_name] = []
-                    current_page_url = driver.current_url
-                    for j, img_src in enumerate(image_srcs):
-                        file_name = os.path.basename(urlparse(img_src).path) or f"{j + 1:02d}.jpg"
-                        save_path = os.path.join(illust_dir, file_name)
-                        download_tasks.append((img_src, save_path, current_page_url))
-                        volume_images_map[volume_name].append(save_path)
-            finally:
-                driver.close();
-                driver.switch_to.window(novel_index_window)
-        if not download_tasks: return {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            list(executor.map(lambda p: download_image(*p), download_tasks))
-    except Exception as e:
-        print(f"插图处理出错: {e}"); return {}
-    return volume_images_map
-
-
-def download_image(url, save_path, referer_url):
-    try:
-        proxies = {"http": None, "https": None}
-        headers = {'User-Agent': 'Mozilla/5.0 ...', 'Referer': referer_url}
-        response = requests.get(url, headers=headers, proxies=proxies, timeout=30)
-        if response.ok:
-            with open(save_path, 'wb') as f: f.write(response.content)
-    except Exception:
-        pass
-
-
-def login_wenku8(driver, username, password):
-    print("正在尝试登录...");
-    try:
-        u, p, b = driver.find_element(By.NAME, "username"), driver.find_element(By.NAME,
-                                                                                "password"), driver.find_element(
-            By.NAME, "submit")
-        u.send_keys(username);
-        p.send_keys(password);
-        b.click();
-        time.sleep(10)
-        if "欢迎您" in driver.page_source:
-            print("登录成功！"); return True
-        else:
-            print("登录失败"); return False
-    except Exception as e:
-        print(f"登录时出错: {e}"); return False
-
-
-def search_for_novel(driver, book_title):
-    try:
-        s, b = driver.find_element(By.ID, "searchkey"), driver.find_element(By.NAME, "Submit")
-        s.clear();
-        s.send_keys(book_title);
-        b.click();
-        return True
-    except Exception as e:
-        print(f"搜索时出错: {e}"); return False
-
-
-def download_txt(novel_id, node, save_path, cookies, referer_url):
-    url = f"https://dl.wenku8.com/down.php?type=txt&node={node}&id={novel_id}"
-    print(f"正在从 Node={node} 下载TXT...")
-    try:
-        proxies = {"http": None, "https": None}
-        headers = {'User-Agent': 'Mozilla/5.0 ...', 'Referer': referer_url}
-        response = requests.get(url, cookies=cookies, timeout=60, proxies=proxies, headers=headers)
-        if response.ok and len(response.content) > 100:
-            with open(save_path, 'wb') as f: f.write(response.content)
-            return True
-    except Exception:
-        pass
-    return False
-
 
 if __name__ == "__main__":
     main()
