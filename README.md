@@ -31,9 +31,9 @@ NOVEL_LIST = [
 ## 3. 运行脚本
 
 ```bash
-python your_script_name.py  # 将 'your_script_name.py' 替换为你的脚本文件名
+python novolmanager.py
 ```
 
-下载的EPUB文件和插图会保存在 `download/小说标题/` 目录下。
+合成的EPUB文件和插图会保存在 `download/小说标题/` 目录下。
 
 ---
